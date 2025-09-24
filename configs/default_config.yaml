@@ -1,0 +1,67 @@
+# SAM 模型配置
+sam:
+  checkpoint: "weights/sam_vit_h_4b8939.pth"
+  model_type: "vit_h"
+  device: "cuda"  # 或 "cpu"
+  
+# 处理参数
+processing:
+  tile_size: 1024
+  overlap: 128
+  min_mask_region_area: 100
+  points_per_side: 32
+  pred_iou_thresh: 0.86
+  stability_score_thresh: 0.92
+  
+# 光谱指数
+spectral_indices:
+  - "NDVI"
+  - "NDWI"
+  - "NDBI"
+  - "SAVI"
+  
+# 类别定义
+classes:
+  urban:
+    - "building"
+    - "road"
+    - "parking lot"
+    - "concrete structure"
+    - "industrial area"
+  vegetation:
+    - "forest"
+    - "grassland"
+    - "cropland"
+    - "park"
+    - "tree canopy"
+  water:
+    - "river"
+    - "lake"
+    - "pond"
+    - "ocean"
+    - "wetland"
+  bare_land:
+    - "soil"
+    - "sand"
+    - "rock"
+    - "desert"
+    - "quarry"
+    
+# 可视化配置
+visualization:
+  colors:
+    unknown: "#808080"
+    urban: "#FF0000"
+    vegetation: "#00FF00"
+    water: "#0000FF"
+    bare_land: "#A52A2A"
+  figure_size: [20, 15]
+  dpi: 300
+  
+# 导出配置
+export:
+  formats:
+    - "geotiff"
+    - "json"
+    - "png"
+  compress: true

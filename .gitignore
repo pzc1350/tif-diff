@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 权重文件
+weights/
+*.pth
+*.ckpt
+*.onnx
+
+# 数据文件
+data/
+*.tif
+*.tiff
+*.geotiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# 输出文件
+output/
+results/
+quick_output/
+*.png
+*.jpg
+*.html
+*.json
+*.csv
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+temp/
+cache/
