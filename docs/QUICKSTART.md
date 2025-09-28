@@ -31,6 +31,57 @@ python quick_start.py your_image.tif
 ### 3. Python代码使用
 
 ```python
+from sam_rs_core import RemoteSensingConfig, RemoteSensingSAM
+
+# 基础配置
+config = RemoteSensingConfig()
+rs_sam = RemoteSensingSAM(config)
+
+# 处理图像
+result = rs_sam.process_remote_sensing_image("image.tif")
+
+# 导出结果
+rs_sam.export_results(result, "output", formats=['geotiff', 'shapefile', 'json'])
+```
+
+## 🛰️ 针对不同传感器的专门优化
+
+### Landsat数据处理
+```python
+config = RemoteSensingConfig(
+    sensor_type="landsat",           # Landsat专用优化
+    viewing_direction="nadir",       # 垂直观测
+    use_spectral_guidance=True,      # 启用光谱指导
+    adaptive_sam_params=True         # 自适应SAM参数
+)
+```
+
+### Sentinel-2数据处理
+```python
+config = RemoteSensingConfig(
+    sensor_type="sentinel2",         # Sentinel-2专用优化
+    tile_size=512,                   # 适合高分辨率的分块大小
+    spectral_indices=['NDVI', 'NDRE', 'MSI']  # 利用红边波段
+)
+```
+
+### 斜视观测数据处理
+```python
+config = RemoteSensingConfig(
+    viewing_direction="oblique",     # 斜视观测优化
+    adaptive_sam_params=True,        # 自动调整参数处理透视变形
+)
+```
+
+## 📊 增强的光谱指数支持
+
+系统支持多种高级光谱指数：
+
+- **传统指数**: NDVI, NDWI, NDBI, SAVI
+- **增强指数**: EVI, MNDWI, NDRE, MSI
+- **自动计算**: 根据传感器类型自动选择最优指数组合
+
+```python
 from quick_start import quick_process
 
 # 处理单张图像
