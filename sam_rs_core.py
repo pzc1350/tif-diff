@@ -46,6 +46,10 @@ class RemoteSensingConfig:
         overlap (int): 分块之间的重叠区域大小（像素）
         min_mask_region_area (int): 最小掩码区域面积（像素）
         rs_classes (Dict[str, List[str]]): 遥感类别定义字典
+        sensor_type (str): 传感器类型，用于优化波段处理
+        viewing_direction (str): 观测方向，影响SAM处理参数
+        use_spectral_guidance (bool): 是否使用光谱指导SAM分割
+        adaptive_sam_params (bool): 是否根据遥感数据特性自适应调整SAM参数
     """
     sam_checkpoint: str = "sam_vit_h_4b8939.pth"
     sam_model_type: str = "vit_h"  # 可选: vit_h, vit_l, vit_b
@@ -57,22 +61,55 @@ class RemoteSensingConfig:
     overlap: int = 128  # 重叠区域
     min_mask_region_area: int = 100  # 最小掩码区域
     
+    # 遥感专门化参数
+    sensor_type: str = "generic"  # generic, landsat, sentinel2, modis, etc.
+    viewing_direction: str = "nadir"  # nadir, oblique, multi-angle
+    use_spectral_guidance: bool = True  # 使用光谱信息指导分割
+    adaptive_sam_params: bool = True  # 自适应调整SAM参数
+    
     # 类别定义
     rs_classes: Dict[str, List[str]] = field(default_factory=dict)
     
     def __post_init__(self):
         """初始化后处理，设置默认值"""
         if not self.spectral_indices:
-            # 默认计算的光谱指数
-            self.spectral_indices = ['NDVI', 'NDWI', 'NDBI', 'SAVI']
+            # 根据传感器类型设置默认光谱指数
+            if self.sensor_type == "landsat":
+                self.spectral_indices = ['NDVI', 'NDWI', 'NDBI', 'SAVI', 'EVI', 'MNDWI']
+            elif self.sensor_type == "sentinel2":
+                self.spectral_indices = ['NDVI', 'NDWI', 'NDBI', 'SAVI', 'NDRE', 'MSI']
+            else:
+                self.spectral_indices = ['NDVI', 'NDWI', 'NDBI', 'SAVI']
             
         if not self.rs_classes:
-            # 默认的遥感类别定义
+            # 增强的遥感类别定义，专门针对遥感应用优化
             self.rs_classes = {
-                'urban': ['building', 'road', 'parking lot', 'concrete structure'],
-                'vegetation': ['forest', 'grassland', 'cropland', 'park'],
-                'water': ['river', 'lake', 'pond', 'ocean'],
-                'bare_land': ['soil', 'sand', 'rock', 'desert']
+                'urban': [
+                    'residential building', 'commercial building', 'industrial building',
+                    'road', 'highway', 'parking lot', 'concrete structure',
+                    'urban area', 'built-up area', 'infrastructure'
+                ],
+                'vegetation': [
+                    'dense forest', 'sparse forest', 'deciduous forest', 'coniferous forest',
+                    'grassland', 'meadow', 'cropland', 'agricultural field',
+                    'park', 'green space', 'vegetation cover'
+                ],
+                'water': [
+                    'river', 'stream', 'lake', 'pond', 'reservoir',
+                    'ocean', 'sea', 'coastal water', 'wetland', 'water body'
+                ],
+                'bare_land': [
+                    'bare soil', 'exposed earth', 'sand', 'rock', 'quarry',
+                    'desert', 'barren land', 'construction site', 'mining area'
+                ],
+                'agriculture': [
+                    'crop field', 'farmland', 'agricultural area', 'cultivated land',
+                    'greenhouse', 'orchard', 'vineyard', 'pasture'
+                ],
+                'natural': [
+                    'mountain', 'hill', 'valley', 'cliff', 'natural terrain',
+                    'geological formation', 'natural landscape'
+                ]
             }
 
 
@@ -152,7 +189,74 @@ class SpectralIndicesCalculator:
         Returns:
             SAVI数组
         """
-        return ((nir - red) / (nir + red + L)) * (1 + L)
+    @staticmethod
+    def calculate_evi(nir: np.ndarray, red: np.ndarray, blue: np.ndarray) -> np.ndarray:
+        """
+        计算增强植被指数 (EVI)
+        
+        EVI = 2.5 * ((NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1))
+        对大气和土壤背景更敏感，适合高密度植被区域
+        
+        Args:
+            nir: 近红外波段数据
+            red: 红光波段数据
+            blue: 蓝光波段数据
+            
+        Returns:
+            EVI数组
+        """
+        return 2.5 * ((nir - red) / (nir + 6 * red - 7.5 * blue + 1 + 1e-8))
+    
+    @staticmethod
+    def calculate_mndwi(green: np.ndarray, swir: np.ndarray) -> np.ndarray:
+        """
+        计算修正归一化水体指数 (MNDWI)
+        
+        MNDWI = (Green - SWIR) / (Green + SWIR)
+        对水体识别更准确，减少建筑阴影干扰
+        
+        Args:
+            green: 绿光波段数据
+            swir: 短波红外波段数据
+            
+        Returns:
+            MNDWI数组
+        """
+        return (green - swir) / (green + swir + 1e-8)
+    
+    @staticmethod
+    def calculate_ndre(nir: np.ndarray, red_edge: np.ndarray) -> np.ndarray:
+        """
+        计算归一化红边指数 (NDRE)
+        
+        NDRE = (NIR - RedEdge) / (NIR + RedEdge)
+        对植被叶绿素含量敏感，适用于Sentinel-2等传感器
+        
+        Args:
+            nir: 近红外波段数据
+            red_edge: 红边波段数据
+            
+        Returns:
+            NDRE数组
+        """
+        return (nir - red_edge) / (nir + red_edge + 1e-8)
+    
+    @staticmethod
+    def calculate_msi(nir: np.ndarray, swir: np.ndarray) -> np.ndarray:
+        """
+        计算水分胁迫指数 (MSI)
+        
+        MSI = SWIR / NIR
+        用于评估植被水分状况
+        
+        Args:
+            nir: 近红外波段数据
+            swir: 短波红外波段数据
+            
+        Returns:
+            MSI数组
+        """
+        return swir / (nir + 1e-8)
     
     @staticmethod
     def calculate_all_indices(image_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -182,15 +286,40 @@ class SpectralIndicesCalculator:
             )
             
         # 计算NDBI
-        if 'swir' in image_data and 'nir' in image_data:
+        swir_band = image_data.get('swir', image_data.get('swir1', None))
+        if swir_band is not None and 'nir' in image_data:
             indices['ndbi'] = SpectralIndicesCalculator.calculate_ndbi(
-                image_data['swir'], image_data['nir']
+                swir_band, image_data['nir']
             )
             
         # 计算SAVI
         if 'nir' in image_data and 'red' in image_data:
             indices['savi'] = SpectralIndicesCalculator.calculate_savi(
                 image_data['nir'], image_data['red']
+            )
+            
+        # 计算EVI
+        if 'nir' in image_data and 'red' in image_data and 'blue' in image_data:
+            indices['evi'] = SpectralIndicesCalculator.calculate_evi(
+                image_data['nir'], image_data['red'], image_data['blue']
+            )
+            
+        # 计算MNDWI
+        if 'green' in image_data and swir_band is not None:
+            indices['mndwi'] = SpectralIndicesCalculator.calculate_mndwi(
+                image_data['green'], swir_band
+            )
+            
+        # 计算NDRE (适用于Sentinel-2等具有红边波段的传感器)
+        if 'nir' in image_data and 'red_edge' in image_data:
+            indices['ndre'] = SpectralIndicesCalculator.calculate_ndre(
+                image_data['nir'], image_data['red_edge']
+            )
+            
+        # 计算MSI
+        if 'nir' in image_data and swir_band is not None:
+            indices['msi'] = SpectralIndicesCalculator.calculate_msi(
+                image_data['nir'], swir_band
             )
             
         return indices
@@ -227,15 +356,13 @@ class RemoteSensingSAM:
         )
         self.sam.to(device=config.device)
         
-        # 配置自动掩码生成器
+        # 根据遥感数据特性配置SAM参数
+        sam_params = self._get_rs_optimized_sam_params()
+        
+        # 配置自动掩码生成器，针对遥感数据优化
         self.mask_generator = SamAutomaticMaskGenerator(
             model=self.sam,
-            points_per_side=32,  # 每边采样点数
-            pred_iou_thresh=0.86,  # 预测IoU阈值
-            stability_score_thresh=0.92,  # 稳定性分数阈值
-            crop_n_layers=1,  # 裁剪层数
-            crop_n_points_downscale_factor=2,  # 裁剪点下采样因子
-            min_mask_region_area=config.min_mask_region_area  # 最小掩码区域
+            **sam_params
         )
         
         # 初始化CLIP模型用于语义理解
@@ -243,6 +370,58 @@ class RemoteSensingSAM:
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         self.clip_model.to(config.device)
+        
+    def _get_rs_optimized_sam_params(self) -> Dict:
+        """
+        获取针对遥感数据优化的SAM参数
+        
+        根据传感器类型、观测方向等因素调整SAM参数
+        
+        Returns:
+            优化后的SAM参数字典
+        """
+        base_params = {
+            'points_per_side': 32,  # 每边采样点数
+            'pred_iou_thresh': 0.86,  # 预测IoU阈值
+            'stability_score_thresh': 0.92,  # 稳定性分数阈值
+            'crop_n_layers': 1,  # 裁剪层数
+            'crop_n_points_downscale_factor': 2,  # 裁剪点下采样因子
+            'min_mask_region_area': self.config.min_mask_region_area
+        }
+        
+        if not self.config.adaptive_sam_params:
+            return base_params
+            
+        # 根据观测方向调整参数
+        if self.config.viewing_direction == "oblique":
+            # 斜视观测时，目标可能有透视变形，降低IoU阈值
+            base_params['pred_iou_thresh'] = 0.82
+            base_params['stability_score_thresh'] = 0.88
+            base_params['points_per_side'] = 36  # 增加采样点
+            
+        elif self.config.viewing_direction == "multi-angle":
+            # 多角度观测时，需要更灵活的分割
+            base_params['pred_iou_thresh'] = 0.80
+            base_params['stability_score_thresh'] = 0.85
+            base_params['crop_n_layers'] = 2  # 增加裁剪层数
+            
+        # 根据传感器类型调整参数
+        if self.config.sensor_type == "modis":
+            # MODIS分辨率较低，需要调整最小区域面积
+            base_params['min_mask_region_area'] = max(500, self.config.min_mask_region_area)
+            base_params['points_per_side'] = 24  # 减少采样点
+            
+        elif self.config.sensor_type in ["landsat", "sentinel2"]:
+            # 中分辨率传感器的标准设置
+            base_params['points_per_side'] = 32
+            base_params['min_mask_region_area'] = max(100, self.config.min_mask_region_area)
+            
+        elif "high_resolution" in self.config.sensor_type:
+            # 高分辨率传感器，可以检测更小的目标
+            base_params['min_mask_region_area'] = max(50, self.config.min_mask_region_area)
+            base_params['points_per_side'] = 40  # 增加采样点以捕获细节
+            
+        return base_params
         
     def process_remote_sensing_image(self, image_path: str) -> Dict:
         """
@@ -319,22 +498,18 @@ class RemoteSensingSAM:
             # 读取所有波段
             bands = {}
             
-            # 常见的多光谱波段映射
-            # 适配Landsat、Sentinel等主流传感器
-            band_names = {
-                1: 'blue',      # 蓝光
-                2: 'green',     # 绿光
-                3: 'red',       # 红光
-                4: 'nir',       # 近红外
-                5: 'swir1',     # 短波红外1
-                6: 'swir2'      # 短波红外2
-            }
+            # 根据传感器类型定义波段映射
+            band_mapping = self._get_sensor_band_mapping(src.count)
             
             # 读取每个波段
             for i in range(1, src.count + 1):
                 band_data = src.read(i)
-                if i in band_names:
-                    bands[band_names[i]] = band_data
+                
+                # 数据预处理：处理NoData值和异常值
+                band_data = self._preprocess_band_data(band_data, src.nodata)
+                
+                if i in band_mapping:
+                    bands[band_mapping[i]] = band_data
                 else:
                     bands[f'band_{i}'] = band_data
                     
@@ -344,6 +519,120 @@ class RemoteSensingSAM:
             
         return bands
     
+    def _get_sensor_band_mapping(self, band_count: int) -> Dict[int, str]:
+        """
+        根据传感器类型获取波段映射
+        
+        Args:
+            band_count: 波段总数
+            
+        Returns:
+            波段编号到波段名称的映射字典
+        """
+        if self.config.sensor_type == "landsat":
+            # Landsat 8/9 波段映射
+            if band_count >= 7:
+                return {
+                    1: 'coastal',    # Coastal/Aerosol
+                    2: 'blue',       # Blue
+                    3: 'green',      # Green
+                    4: 'red',        # Red
+                    5: 'nir',        # Near Infrared
+                    6: 'swir1',      # SWIR 1
+                    7: 'swir2'       # SWIR 2
+                }
+            else:
+                # Landsat 5/7 波段映射
+                return {
+                    1: 'blue',
+                    2: 'green',
+                    3: 'red',
+                    4: 'nir',
+                    5: 'swir1',
+                    7: 'swir2'
+                }
+                
+        elif self.config.sensor_type == "sentinel2":
+            # Sentinel-2 波段映射（选择主要波段）
+            return {
+                1: 'coastal',      # B1 - Coastal aerosol
+                2: 'blue',         # B2 - Blue
+                3: 'green',        # B3 - Green
+                4: 'red',          # B4 - Red
+                5: 'red_edge1',    # B5 - Red Edge 1
+                6: 'red_edge2',    # B6 - Red Edge 2
+                7: 'red_edge3',    # B7 - Red Edge 3
+                8: 'nir',          # B8 - NIR
+                9: 'nir_narrow',   # B8A - NIR Narrow
+                10: 'water_vapor', # B9 - Water vapor
+                11: 'swir1',       # B11 - SWIR 1
+                12: 'swir2'        # B12 - SWIR 2
+            }
+            
+        elif self.config.sensor_type == "modis":
+            # MODIS波段映射（部分常用波段）
+            return {
+                1: 'red',          # Band 1 - Red
+                2: 'nir',          # Band 2 - NIR
+                3: 'blue',         # Band 3 - Blue
+                4: 'green',        # Band 4 - Green
+                5: 'swir1',        # Band 5 - SWIR 1
+                6: 'swir2',        # Band 6 - SWIR 2
+                7: 'swir3'         # Band 7 - SWIR 3
+            }
+            
+        else:
+            # 通用映射
+            mapping = {
+                1: 'blue',
+                2: 'green', 
+                3: 'red',
+                4: 'nir'
+            }
+            if band_count >= 5:
+                mapping[5] = 'swir1'
+            if band_count >= 6:
+                mapping[6] = 'swir2'
+            if band_count >= 7:
+                mapping[7] = 'red_edge'
+                
+            return mapping
+    
+    def _preprocess_band_data(self, band_data: np.ndarray, nodata_value) -> np.ndarray:
+        """
+        预处理波段数据
+        
+        处理NoData值、异常值，并进行必要的数据类型转换
+        
+        Args:
+            band_data: 原始波段数据
+            nodata_value: NoData值
+            
+        Returns:
+            预处理后的波段数据
+        """
+        # 处理NoData值
+        if nodata_value is not None:
+            band_data = np.where(band_data == nodata_value, 0, band_data)
+            
+        # 处理异常值（通常是由于传感器故障或大气影响）
+        # 使用99.5%分位数作为上限
+        upper_limit = np.percentile(band_data[band_data > 0], 99.5)
+        band_data = np.clip(band_data, 0, upper_limit)
+        
+        # 数据归一化（如果数据是整型且范围很大）
+        if band_data.dtype in [np.uint16, np.int16] and band_data.max() > 1:
+            # 假设是DN值，进行基本的归一化
+            if band_data.max() > 10000:  # 可能是Landsat等DN值
+                band_data = band_data.astype(np.float32) / 10000.0
+            else:  # 可能是Sentinel-2等反射率值
+                band_data = band_data.astype(np.float32) / 10000.0
+        elif band_data.dtype == np.uint8:
+            # 8位数据归一化到[0,1]
+            band_data = band_data.astype(np.float32) / 255.0
+            
+        return band_data
+    
     def _create_enhanced_rgb(
         self, 
         image_data: Dict[str, np.ndarray], 
@@ -352,7 +641,8 @@ class RemoteSensingSAM:
         """
         创建增强的RGB图像用于SAM处理
         
-        将多光谱数据转换为RGB格式，并进行增强以提高分割效果
+        将多光谱数据转换为RGB格式，并进行增强以提高分割效果。
+        可选地使用光谱信息进行增强。
         
         Args:
             image_data: 包含各波段数据的字典
@@ -361,16 +651,27 @@ class RemoteSensingSAM:
         Returns:
             增强后的RGB图像 (H, W, 3)
         """
-        # 获取RGB波段
-        r = image_data.get('red', image_data.get('band_3', None))
-        g = image_data.get('green', image_data.get('band_2', None))
-        b = image_data.get('blue', image_data.get('band_1', None))
+        # 获取RGB波段（优先使用标准波段名称）
+        r = image_data.get('red', image_data.get('band_3', image_data.get('band_4', None)))
+        g = image_data.get('green', image_data.get('band_2', image_data.get('band_3', None)))
+        b = image_data.get('blue', image_data.get('band_1', image_data.get('band_2', None)))
         
         if r is None or g is None or b is None:
-            raise ValueError("无法找到RGB波段")
+            # 尝试使用近红外创建伪彩色合成
+            nir = image_data.get('nir', image_data.get('band_4', image_data.get('band_5', None)))
+            if nir is not None:
+                r = nir  # NIR作为红色通道
+                g = image_data.get('red', image_data.get('band_3', r))  # Red作为绿色通道
+                b = image_data.get('green', image_data.get('band_2', g))  # Green作为蓝色通道
+            else:
+                raise ValueError("无法找到足够的波段创建RGB图像")
             
         # 堆叠为RGB图像
         rgb = np.stack([r, g, b], axis=-1)
+        
+        # 使用光谱指导增强（如果启用）
+        if self.config.use_spectral_guidance and spectral_indices:
+            rgb = self._apply_spectral_guidance(rgb, spectral_indices)
         
         # 增强对比度以提高分割效果
         rgb = self._enhance_contrast(rgb)
@@ -379,6 +680,60 @@ class RemoteSensingSAM:
         rgb = (rgb * 255).astype(np.uint8)
         
         return rgb
+    
+    def _apply_spectral_guidance(
+        self, 
+        rgb: np.ndarray, 
+        spectral_indices: Dict[str, np.ndarray]
+    ) -> np.ndarray:
+        """
+        使用光谱指数信息增强RGB图像
+        
+        根据光谱指数调整RGB各通道，突出不同地物特征
+        
+        Args:
+            rgb: 原始RGB图像
+            spectral_indices: 光谱指数字典
+            
+        Returns:
+            光谱增强后的RGB图像
+        """
+        enhanced_rgb = rgb.copy()
+        
+        # 使用NDVI增强植被
+        if 'ndvi' in spectral_indices:
+            ndvi = spectral_indices['ndvi']
+            vegetation_mask = ndvi > 0.3
+            # 增强绿色通道以突出植被
+            enhanced_rgb[:, :, 1] = np.where(
+                vegetation_mask,
+                np.clip(enhanced_rgb[:, :, 1] * 1.2, 0, 1),
+                enhanced_rgb[:, :, 1]
+            )
+            
+        # 使用NDWI增强水体
+        if 'ndwi' in spectral_indices:
+            ndwi = spectral_indices['ndwi']
+            water_mask = ndwi > 0.1
+            # 增强蓝色通道以突出水体
+            enhanced_rgb[:, :, 2] = np.where(
+                water_mask,
+                np.clip(enhanced_rgb[:, :, 2] * 1.3, 0, 1),
+                enhanced_rgb[:, :, 2]
+            )
+            
+        # 使用NDBI增强建筑
+        if 'ndbi' in spectral_indices:
+            ndbi = spectral_indices['ndbi']
+            urban_mask = ndbi > 0.05
+            # 调整RGB平衡以突出建筑区域
+            enhanced_rgb[:, :, 0] = np.where(
+                urban_mask,
+                np.clip(enhanced_rgb[:, :, 0] * 1.1, 0, 1),
+                enhanced_rgb[:, :, 0]
+            )
+            
+        return enhanced_rgb
     
     def _enhance_contrast(self, image: np.ndarray) -> np.ndarray:
         """
@@ -642,7 +997,8 @@ class RemoteSensingSAM:
         """
         基于光谱特征细化分类结果
         
-        使用专家知识和光谱指数阈值来校正CLIP的分类结果
+        使用专家知识和光谱指数阈值来校正CLIP的分类结果，
+        结合多个光谱指数进行综合判断
         
         Args:
             category: CLIP预测的类别
@@ -651,30 +1007,82 @@ class RemoteSensingSAM:
         Returns:
             校正后的类别
         """
-        # 基于NDVI的规则
-        if 'ndvi_mean' in mask_indices:
-            ndvi = mask_indices['ndvi_mean']
-            if ndvi > 0.6:
-                # 高NDVI值表示茂密植被
-                return 'vegetation'
+        # 基于多光谱指数的决策树分类
+        
+        # 获取关键光谱指数
+        ndvi = mask_indices.get('ndvi_mean', 0)
+        ndwi = mask_indices.get('ndwi_mean', 0)
+        ndbi = mask_indices.get('ndbi_mean', 0)
+        savi = mask_indices.get('savi_mean', 0)
+        
+        # 植被识别规则
+        if ndvi > 0.6 and savi > 0.4:
+            # 高NDVI和SAVI表示茂密植被
+            if ndvi > 0.8:
+                return 'vegetation'  # 茂密植被
+            else:
+                return 'vegetation'  # 中等植被
+                
+        elif ndvi > 0.3 and ndvi <= 0.6:
+            # 中等NDVI值，可能是稀疏植被或农田
+            if 'evi_mean' in mask_indices and mask_indices['evi_mean'] > 0.3:
+                return 'agriculture'  # 农田
+            else:
+                return 'vegetation'  # 稀疏植被
+                
+        # 水体识别规则
+        elif ndwi > 0.3:
+            # 高NDWI值表示水体
+            if 'mndwi_mean' in mask_indices and mask_indices['mndwi_mean'] > 0.4:
+                return 'water'  # 确定的水体
             elif ndvi < 0:
-                # 负NDVI值可能是水体或建筑
-                return 'water' if mask_indices.get('ndwi_mean', 0) > 0.3 else 'urban'
+                return 'water'  # 负NDVI也支持是水体
+            else:
+                return 'water'  # 可能的水体
                 
-        # 基于NDWI的规则
-        if 'ndwi_mean' in mask_indices:
-            ndwi = mask_indices['ndwi_mean']
-            if ndwi > 0.3:
-                # 高NDWI值表示水体
-                return 'water'
+        # 建筑/城市区域识别规则
+        elif ndbi > 0.1 or (ndvi < 0.1 and ndwi < 0.1):
+            # 正NDBI或低植被低水分指数表示建筑区域
+            if ndbi > 0.2:
+                return 'urban'  # 高密度建成区
+            elif ndvi < 0.05:
+                return 'urban'  # 低植被覆盖的城市区域
+            else:
+                return 'bare_land'  # 可能是裸地
                 
-        # 基于NDBI的规则
-        if 'ndbi_mean' in mask_indices:
-            ndbi = mask_indices['ndbi_mean']
+        # 裸地识别规则
+        elif ndvi < 0.2 and ndwi < 0.1 and ndbi < 0.1:
+            # 低植被、低水分、低建筑指数表示裸地
+            if 'msi_mean' in mask_indices:
+                msi = mask_indices['msi_mean']
+                if msi > 1.5:
+                    return 'bare_land'  # 干燥裸地
+                else:
+                    return 'bare_land'  # 湿润裸地
+            else:
+                return 'bare_land'
+                
+        # 农业区域特殊处理
+        elif 0.2 <= ndvi <= 0.6 and 'evi_mean' in mask_indices:
+            evi = mask_indices['evi_mean']
+            if evi > 0.25:
+                return 'agriculture'  # 农田
+                
+        # 如果无法通过光谱指数确定，则使用CLIP结果
+        # 但进行一些基本的合理性检查
+        if category == 'vegetation' and ndvi < 0.1:
+            # CLIP认为是植被但NDVI很低，可能误分类
+            return 'bare_land'
+        elif category == 'water' and ndwi < 0:
+            # CLIP认为是水体但NDWI为负，可能误分类
             if ndbi > 0.1:
-                # 正NDBI值可能表示建筑区域
                 return 'urban'
-                
+            else:
+                return 'bare_land'
+        elif category == 'urban' and ndvi > 0.5:
+            # CLIP认为是城市但NDVI很高，可能是公园绿地
+            return 'vegetation'
+            
         return category
     
     def _generate_segmentation_map(
@@ -717,6 +1125,184 @@ class RemoteSensingSAM:
             segmentation_map[mask_data['segmentation']] = color
             
         return segmentation_map
+    
+    def export_results(
+        self,
+        results: Dict,
+        output_dir: str,
+        formats: List[str] = ['geotiff', 'shapefile', 'json']
+    ) -> None:
+        """
+        导出处理结果为多种遥感格式
+        
+        Args:
+            results: process_remote_sensing_image返回的结果字典
+            output_dir: 输出目录
+            formats: 导出格式列表
+        """
+        import os
+        from pathlib import Path
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        segmentation_map = results['segmentation_map']
+        masks = results['masks']
+        metadata = results['metadata']
+        
+        # 导出GeoTIFF格式
+        if 'geotiff' in formats:
+            self._export_geotiff(
+                segmentation_map,
+                output_path / 'segmentation.tif',
+                metadata
+            )
+            
+        # 导出Shapefile格式
+        if 'shapefile' in formats:
+            self._export_shapefile(
+                masks,
+                output_path / 'segments.shp',
+                metadata
+            )
+            
+        # 导出JSON格式
+        if 'json' in formats:
+            self._export_json(
+                results,
+                output_path / 'results.json'
+            )
+            
+        print(f"结果已导出到: {output_dir}")
+    
+    def _export_geotiff(
+        self,
+        segmentation_map: np.ndarray,
+        output_path: Path,
+        metadata: Dict
+    ) -> None:
+        """导出为GeoTIFF格式"""
+        try:
+            import rasterio
+            from rasterio.transform import from_gdal
+            
+            # 重建Transform对象
+            if hasattr(self, 'transform'):
+                transform = self.transform
+            else:
+                transform = from_gdal(*metadata['transform'])
+                
+            with rasterio.open(
+                output_path,
+                'w',
+                driver='GTiff',
+                height=segmentation_map.shape[0],
+                width=segmentation_map.shape[1],
+                count=1,
+                dtype=segmentation_map.dtype,
+                crs=self.crs if hasattr(self, 'crs') else metadata.get('crs'),
+                transform=transform
+            ) as dst:
+                dst.write(segmentation_map, 1)
+                
+        except ImportError:
+            print("警告: 无法导出GeoTIFF格式，请安装rasterio")
+    
+    def _export_shapefile(
+        self,
+        masks: List[Dict],
+        output_path: Path,
+        metadata: Dict
+    ) -> None:
+        """导出为Shapefile格式"""
+        try:
+            import geopandas as gpd
+            from shapely.geometry import Polygon
+            from rasterio.features import shapes
+            from rasterio.transform import from_gdal
+            import pandas as pd
+            
+            # 准备数据
+            geometries = []
+            attributes = []
+            
+            # 重建Transform对象
+            if hasattr(self, 'transform'):
+                transform = self.transform
+            else:
+                transform = from_gdal(*metadata['transform'])
+            
+            for i, mask_data in enumerate(masks):
+                # 将掩码转换为多边形
+                mask = mask_data['segmentation'].astype(np.uint8)
+                for geom, value in shapes(mask, transform=transform):
+                    if value > 0:  # 只处理非零值
+                        geometries.append(Polygon(geom['coordinates'][0]))
+                        attributes.append({
+                            'id': i,
+                            'category': mask_data.get('category', 'unknown'),
+                            'class': mask_data.get('class', 'unknown'),
+                            'confidence': mask_data.get('confidence', 0.0),
+                            'area': mask_data.get('area', 0)
+                        })
+            
+            if geometries:
+                # 创建GeoDataFrame
+                gdf = gpd.GeoDataFrame(attributes, geometry=geometries)
+                if hasattr(self, 'crs'):
+                    gdf.crs = self.crs
+                    
+                # 保存为Shapefile
+                gdf.to_file(output_path)
+                
+        except ImportError:
+            print("警告: 无法导出Shapefile格式，请安装geopandas")
+    
+    def _export_json(self, results: Dict, output_path: Path) -> None:
+        """导出为JSON格式"""
+        import json
+        
+        # 准备可序列化的数据
+        export_data = {
+            'metadata': results['metadata'],
+            'spectral_indices_stats': {},
+            'classification_summary': {},
+            'masks': []
+        }
+        
+        # 光谱指数统计
+        for name, index_map in results['spectral_indices'].items():
+            export_data['spectral_indices_stats'][name] = {
+                'mean': float(np.mean(index_map)),
+                'std': float(np.std(index_map)),
+                'min': float(np.min(index_map)),
+                'max': float(np.max(index_map))
+            }
+            
+        # 分类统计
+        categories = {}
+        for mask in results['masks']:
+            category = mask.get('category', 'unknown')
+            categories[category] = categories.get(category, 0) + 1
+            
+        export_data['classification_summary'] = categories
+        
+        # 掩码信息（不包含大数组）
+        for mask in results['masks']:
+            mask_info = {
+                'category': mask.get('category', 'unknown'),
+                'class': mask.get('class', 'unknown'),
+                'confidence': mask.get('confidence', 0.0),
+                'area': mask.get('area', 0),
+                'bbox': mask.get('bbox', []),
+                'spectral_features': mask.get('spectral_features', {})
+            }
+            export_data['masks'].append(mask_info)
+        
+        # 保存JSON
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+    
     
     def _extract_metadata(self, image_path: str) -> Dict:
         """
